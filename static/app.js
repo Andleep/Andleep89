@@ -1,83 +1,95 @@
-// UI logic
-const symbolSelect = document.getElementById("symbolSelect");
-const monthsSelect = document.getElementById("monthsSelect");
-const intervalSelect = document.getElementById("intervalSelect");
-const runBtn = document.getElementById("runBtn");
-const uploadCsvBtn = document.getElementById("uploadCsv");
-const csvFile = document.getElementById("csvFile");
-const statsDiv = document.getElementById("stats");
-const tradesTbody = document.querySelector("#tradesTable tbody");
-const balanceEl = document.getElementById("balance");
-let chart;
+// static/app.js
+let chart = null;
 
-async function loadSymbols(){
-  const res = await fetch("/api/status");
-  const j = await res.json();
-  const syms = j.symbols || ["ETHUSDT"];
-  symbolSelect.innerHTML = syms.map(s=>`<option value="${s}">${s}</option>`).join("");
+function isoTime(t){
+  try{
+    // if t is ms int
+    if(typeof t === "number") return new Date(t).toLocaleString();
+    if(!isNaN(Number(t))) return new Date(Number(t)).toLocaleString();
+    return t;
+  }catch(e){return t;}
 }
-loadSymbols();
 
-runBtn.onclick = async ()=>{
-  const symbol = symbolSelect.value;
-  const months = parseInt(monthsSelect.value);
-  const interval = intervalSelect.value;
-  statsDiv.innerText = "جاري المحاكاة...";
-  let body = {symbol, months, interval, initial_balance:10.0};
-  if(months === 0){
-    alert("اختر ملف CSV ثم اضغط رفع CSV ثم نفّذ المحاكاة.");
-    return;
-  }
-  const res = await fetch("/api/backtest", {
+async function fetchStatus(){
+  const r = await fetch("/api/status");
+  const j = await r.json();
+  document.getElementById("balance").textContent = (Math.round((j.balance + Number.EPSILON)*100000000)/100000000).toString();
+  drawChart(j.candles, j.trades);
+  populateTrades(j.trades);
+}
+
+function drawChart(candles, trades){
+  const labels = candles.map(c=> isoTime(c.time));
+  const closes = candles.map(c=> c.close);
+  // trade markers
+  const buys = trades.filter(t=> t.profit >=0 || t.reason === "CLOSE").map(t=> ({x: isoTime(t.time), y: t.exit}));
+  const sells = trades.filter(t=> t.profit < 0 && t.reason !== "CLOSE").map(t=> ({x: isoTime(t.time), y: t.exit}));
+  const ctx = document.getElementById('priceChart').getContext('2d');
+  if(chart) chart.destroy();
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        { label: 'Close', data: closes, borderColor:'#2b8aef', tension:0.1, pointRadius:0 },
+        { label: 'Buys', data: buys.map(p=> p.y), pointBackgroundColor:'green', type:'scatter', showLine:false },
+        { label: 'Sells', data: sells.map(p=> p.y), pointBackgroundColor:'red', type:'scatter', showLine:false }
+      ]
+    },
+    options: {
+      interaction:{mode:'index'},
+      plugins:{legend:{display:true}},
+      scales:{ x:{ display:true } }
+    }
+  });
+}
+
+function populateTrades(trades){
+  const tbody = document.querySelector("#trades-table tbody");
+  tbody.innerHTML = "";
+  trades.slice().reverse().forEach(t=>{
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${isoTime(t.time)}</td><td>${t.entry}</td><td>${t.exit}</td><td>${t.profit}</td><td>${t.balance_after}</td><td>${t.reason}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+document.getElementById("load-sample").addEventListener("click", async ()=>{
+  await fetch("/api/load_sample");
+  await fetchStatus();
+});
+
+document.getElementById("run-backtest").addEventListener("click", async ()=>{
+  const body = {
+    ema_short: 20,
+    ema_long: 50,
+    rsi_period: 14,
+    volume_multiplier: 1.2
+  };
+  const r = await fetch("/api/run_backtest", {
     method: "POST",
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify(body)
   });
-  const data = await res.json();
-  if(data.error){ statsDiv.innerText = "خطأ: " + data.error; return; }
-  const stats = data.stats;
-  const trades = data.trades;
-  statsDiv.innerHTML = `البداية $${stats.initial_balance} — النهاية $${stats.final_balance} — صفقات: ${stats.trades} — فوز: ${stats.wins} — خسارة: ${stats.losses} — نسبة فوز: ${stats.win_rate}%`;
-  balanceEl.innerText = `الرصيد: $${stats.final_balance}`;
-  updateTrades(trades);
-  const c = await fetch(`/api/candles?symbol=${symbol}&limit=500&interval=${interval}`).then(r=>r.json());
-  if(!c.error) buildChart(c.candles);
-};
+  const j = await r.json();
+  alert("Backtest finished. Final balance: "+ j.final_balance.toFixed(8));
+  await fetchStatus();
+});
 
-uploadCsvBtn.onclick = ()=> csvFile.click();
-csvFile.onchange = async (e)=>{
-  const f = e.target.files[0];
+document.getElementById("file").addEventListener("change", async (ev)=>{
+  const f = ev.target.files[0];
   if(!f) return;
-  const fd = new FormData();
-  fd.append("csv", f);
-  const res = await fetch("/api/backtest", {method:"POST", body: fd});
-  const data = await res.json();
-  if(data.error){ alert("Upload error: "+data.error); return; }
-  alert("CSV uploaded and simulated. See results in UI.");
-  const stats = data.stats;
-  const trades = data.trades;
-  statsDiv.innerHTML = `البداية $${stats.initial_balance} — النهاية $${stats.final_balance} — صفقات: ${stats.trades}`;
-  updateTrades(trades);
-};
+  const form = new FormData();
+  form.append("file", f);
+  const r = await fetch("/api/upload_csv", { method:"POST", body: form });
+  const j = await r.json();
+  if(j.error) alert("Upload error: "+ j.error);
+  else {
+    alert("Uploaded "+ j.candles +" candles.");
+    await fetchStatus();
+  }
+});
 
-function updateTrades(trades){
-  tradesTbody.innerHTML = trades.slice().reverse().map(t=>`<tr>
-    <td>${new Date(t.time).toLocaleString()}</td>
-    <td>${t.entry?.toFixed(6)||''}</td>
-    <td>${t.exit?.toFixed(6)||''}</td>
-    <td class="${t.profit>=0?'green':'red'}">${t.profit?.toFixed(6)||''}</td>
-    <td>${t.balance_after?.toFixed(6)||''}</td>
-    <td>${t.reason||''}</td>
-  </tr>`).join('');
-}
-
-function buildChart(candles){
-  const ds = candles.map(c=>({x:new Date(c.time), o:c.open, h:c.high, l:c.low, c:c.close}));
-  const ctx = document.getElementById("chart").getContext("2d");
-  if(chart) chart.destroy();
-  chart = new Chart(ctx, {
-    type:'candlestick',
-    data:{datasets:[{label:'Price', data:ds}]},
-    options:{plugins:{legend:{display:false}}, scales:{x:{time:{unit:'minute'}}}}
-  });
-}
+// initial
+fetchStatus();
+setInterval(fetchStatus, 5000);
