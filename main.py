@@ -1,278 +1,218 @@
-# main.py - TradeBot (no pandas) - Flask app
-import os, time, csv, math, threading
-from datetime import datetime, timedelta
+# main.py
+import os
+import json
+import threading
+import time
+from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file
+from strategy import generate_signals
 import requests
+import numpy as np
+import csv
+from io import StringIO
 
-# CONFIG
-SYMBOLS = os.getenv("SYMBOLS", "ETHUSDT,BTCUSDT,BNBUSDT,SOLUSDT,ADAUSDT").split(",")
-INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10.0"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
-EMA_FAST = int(os.getenv("EMA_FAST", "8"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", "1.0"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.01"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
-KL_LIMIT = int(os.getenv("KL_LIMIT", "1000"))
-BINANCE_KLINES = os.getenv("BINANCE_KLINES", "https://api.binance.com/api/v3/klines")
+app = Flask(__name__, static_folder="static", template_folder="templates")
 
-DEBUG_LOG = "bot_debug.log"
-TRADE_LOG = "trades.csv"
+# config (تعديل سهل)
+INITIAL_BALANCE = 10.0
+POSITION_SIZE_PCT = 0.03      # يخاطر 3% من الرصيد في كل صفقة (قابل للتعديل)
+MAX_POSITION_PCT = 0.25
+STOP_LOSS_PCT = 0.01          # 1% stop
+TAKE_PROFIT_PCT = 0.02        # 2% take profit (اختياري)
+EMA_SHORT = 20
+EMA_LONG = 50
+RSI_PERIOD = 14
+VOLUME_MULTIPLIER = 1.2
 
-app = Flask(__name__, template_folder="templates", static_folder="static")
+# in-memory state
+state = {
+    "balance": INITIAL_BALANCE,
+    "trades": [],    # قائمة الصفقات (history)
+    "candles": [],   # بيانات الشموع الحالية المستخدمة للعروض
+    "running": False
+}
 
-# Global state
-balance_lock = threading.Lock()
-balance = INITIAL_BALANCE
-current_trade = None
-trade_history = []
-stats = {"trades":0, "wins":0, "losses":0, "profit_usd":0.0}
-
-def debug(msg):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line)
-    try:
-        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-
-def fetch_klines(symbol, interval="1m", limit=KL_LIMIT):
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    headers = {"User-Agent":"TradeBot-NoPandas/1.0"}
-    r = requests.get(BINANCE_KLINES, params=params, headers=headers, timeout=15)
-    r.raise_for_status()
-    data = r.json()
+def parse_csv_candles(text):
+    """
+    نتوقع ملف CSV بعناوين: time,open,high,low,close,volume
+    time can be ISO or ms epoch.
+    """
+    reader = csv.DictReader(StringIO(text))
     out = []
-    for k in data:
-        out.append({
-            "time": int(k[0]),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5])
-        })
-    return out
-
-# Indicators
-def ema_list(values, span):
-    if not values:
-        return []
-    alpha = 2.0 / (span + 1)
-    out = [values[0]]
-    for v in values[1:]:
-        out.append((v - out[-1]) * alpha + out[-1])
-    return out
-
-def sma_list(values, period):
-    out = []
-    s = 0.0
-    for i, v in enumerate(values):
-        s += v
-        if i >= period:
-            s -= values[i-period]
-            out.append(s/period)
-        elif i == period-1:
-            out.append(s/period)
-    return out
-
-def rsi_list(values, period=14):
-    if len(values) < period+1:
-        return [50.0] * len(values)
-    deltas = [values[i] - values[i-1] for i in range(1, len(values))]
-    ups = [d if d>0 else 0 for d in deltas]
-    downs = [-d if d<0 else 0 for d in deltas]
-    up_avg = sum(ups[:period]) / period
-    down_avg = sum(downs[:period]) / period if sum(downs[:period])!=0 else 1e-9
-    out = [50.0] * (period+1)
-    for u, d in zip(ups[period:], downs[period:]):
-        up_avg = (up_avg*(period-1) + u) / period
-        down_avg = (down_avg*(period-1) + d) / period
-        rs = up_avg / (down_avg + 1e-12)
-        out.append(100 - (100/(1+rs)))
-    return out
-
-def atr_list(highs, lows, closes, period=14):
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-        trs.append(tr)
-    if not trs:
-        return [0.0]*len(closes)
-    if len(trs) < period:
-        avg = sum(trs)/len(trs)
-        return [avg]*len(closes)
-    sma_tr = sma_list(trs, period)
-    return [sma_tr[0]]*period + sma_tr
-
-def run_backtest(candles, initial_balance=INITIAL_BALANCE, risk_per_trade=RISK_PER_TRADE, stop_loss_pct=STOP_LOSS_PCT):
-    closes = [c["close"] for c in candles]
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    vols = [c["volume"] for c in candles]
-    times = [c["time"] for c in candles]
-
-    ema_fast = ema_list(closes, EMA_FAST)
-    ema_slow = ema_list(closes, EMA_SLOW)
-    rsi_vals = rsi_list(closes, RSI_PERIOD)
-    atr_vals = atr_list(highs, lows, closes, period=14)
-    avg_vol20 = []
-    for i in range(len(vols)):
-        window = vols[max(0, i-20):i]
-        avg_vol20.append(sum(window)/len(window) if window else vols[i])
-
-    balance_local = float(initial_balance)
-    position = None
-    trades = []
-    wins = 0
-    losses = 0
-
-    for i in range(len(closes)):
-        if i < max(EMA_SLOW, RSI_PERIOD) + 2:
-            continue
-        price = closes[i]
-        prev_i = i-1
-        cross_up = (ema_fast[prev_i] <= ema_slow[prev_i]) and (ema_fast[i] > ema_slow[i])
-        cross_down = (ema_fast[prev_i] >= ema_slow[prev_i]) and (ema_fast[i] < ema_slow[i])
-        vol_ok = vols[i] > (avg_vol20[i] * VOLUME_MULTIPLIER)
-        rsi_ok = (rsi_vals[prev_i] > 25 and rsi_vals[prev_i] < 75)
-
-        if position is None:
-            if cross_up and vol_ok and rsi_ok:
-                risk_amount = balance_local * risk_per_trade
-                if stop_loss_pct <= 0:
-                    qty = balance_local / price
+    for row in reader:
+        try:
+            t = row.get('time') or row.get('timestamp') or row.get('Date') or row.get('date')
+            # حاول تحويل الى int ms أو الى ISO
+            try:
+                if '.' in t or len(t) > 12:
+                    # ISO
+                    dt = t
                 else:
-                    qty = risk_amount / (price * stop_loss_pct)
-                qty = max(qty, 1e-8)
-                stop_price = price * (1 - stop_loss_pct)
-                position = {"entry": price, "qty": qty, "stop": stop_price, "entry_time": times[i]}
-                debug(f"ENTER idx={i} price={price:.6f} qty={qty:.8f} bal={balance_local:.8f}")
-        else:
-            if lows[i] <= position["stop"]:
-                exit_price = position["stop"]
-                proceeds = position["qty"] * exit_price
-                profit = proceeds - (position["qty"] * position["entry"])
-                balance_local = proceeds
-                trades.append({"time": times[i], "entry": position["entry"], "exit": exit_price, "profit": profit, "balance_after": balance_local, "reason":"SL"})
-                if profit>=0: wins+=1
-                else: losses+=1
-                debug(f"EXIT SL idx={i} exit={exit_price:.6f} profit={profit:.8f} newbal={balance_local:.8f}")
-                position = None
-                continue
-            if cross_down:
-                exit_price = price
-                proceeds = position["qty"] * exit_price
-                profit = proceeds - (position["qty"] * position["entry"])
-                balance_local = proceeds
-                trades.append({"time": times[i], "entry": position["entry"], "exit": exit_price, "profit": profit, "balance_after": balance_local, "reason":"X"})
-                if profit>=0: wins+=1
-                else: losses+=1
-                debug(f"EXIT X idx={i} exit={exit_price:.6f} profit={profit:.8f} newbal={balance_local:.8f}")
-                position = None
-                continue
-
-    stats = {"initial_balance": initial_balance, "final_balance": round(balance_local,8), "profit_usd": round(balance_local-initial_balance,8),
-             "trades": len(trades), "wins": wins, "losses": losses, "win_rate": round((wins/(wins+losses)*100) if (wins+losses)>0 else 0,2)}
-    return stats, trades
+                    # epoch seconds/millis
+                    v = int(t)
+                    if v > 1e12:
+                        dt = int(v)
+                    else:
+                        dt = int(v)*1000
+                # we will keep time as int ms if numeric
+            except Exception:
+                dt = t
+            c = {
+                "time": dt,
+                "open": float(row['open']),
+                "high": float(row['high']),
+                "low": float(row['low']),
+                "close": float(row['close']),
+                "volume": float(row.get('volume', 0.0))
+            }
+            out.append(c)
+        except Exception:
+            continue
+    return out
 
 @app.route("/")
 def index():
     return render_template("index.html")
 
+@app.route("/api/upload_csv", methods=["POST"])
+def upload_csv():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error":"no file"}), 400
+    text = f.stream.read().decode('utf-8')
+    candles = parse_csv_candles(text)
+    if not candles:
+        return jsonify({"error":"no valid candles parsed"}), 400
+    # keep latest N candles
+    state['candles'] = candles[-1000:]
+    state['trades'] = []
+    state['balance'] = INITIAL_BALANCE
+    return jsonify({"status":"ok", "candles": len(state['candles'])})
+
+@app.route("/api/load_sample")
+def load_sample():
+    # تحميل مثال صغير من GitHub gist (لو فشل استخدم بيانات مولدة)
+    url = "https://raw.githubusercontent.com/Andleep/Trend-andleep89/main/sample_eth.csv"
+    try:
+        r = requests.get(url, timeout=6)
+        r.raise_for_status()
+        state['candles'] = parse_csv_candles(r.text)
+    except Exception:
+        # generate synthetic sinusoidal data as fallback
+        now = int(time.time()*1000)
+        candles = []
+        price = 4000.0
+        for i in range(500):
+            o = price + np.random.randn()*3
+            c = o + np.random.randn()*2
+            h = max(o,c) + abs(np.random.randn()*2)
+            l = min(o,c) - abs(np.random.randn()*2)
+            candles.append({"time": now - (500-i)*60000, "open":o,"high":h,"low":l,"close":c,"volume":abs(np.random.randn()*1000)})
+            price = c
+        state['candles'] = candles
+    state['trades'] = []
+    state['balance'] = INITIAL_BALANCE
+    return jsonify({"status":"ok", "candles": len(state['candles'])})
+
+@app.route("/api/run_backtest", methods=["POST"])
+def run_backtest():
+    """
+    Runs backtest on currently loaded candles using the strategy.generate_signals.
+    Returns trades list and final balance.
+    """
+    cfg = {
+        "ema_short": int(request.json.get("ema_short", EMA_SHORT)),
+        "ema_long": int(request.json.get("ema_long", EMA_LONG)),
+        "rsi_period": int(request.json.get("rsi_period", RSI_PERIOD)),
+        "volume_multiplier": float(request.json.get("volume_multiplier", VOLUME_MULTIPLIER))
+    }
+    candles = state.get('candles', [])
+    if not candles:
+        return jsonify({"error":"no candles loaded"}), 400
+
+    signals = generate_signals(candles, cfg)
+
+    balance = INITIAL_BALANCE
+    current = None  # current trade dict
+    trades = []
+
+    for i in range(len(candles)):
+        sig = signals[i]
+        price = candles[i]['close']
+        # check stoploss for open trade
+        if current is not None:
+            # check SL
+            if price <= current['stop_price']:
+                # exit at current price
+                proceeds = current['qty'] * price
+                profit = proceeds - current['cost']
+                balance += profit
+                trades.append({
+                    "time": candles[i]['time'], "symbol": "SIM",
+                    "entry": current['entry'], "exit": price,
+                    "profit": profit, "balance_after": balance, "reason":"SL"
+                })
+                current = None
+                continue
+        # handle signal
+        if sig == "ENTER" and current is None:
+            # position sizing (value)
+            desired_value = balance * POSITION_SIZE_PCT
+            desired_value = min(desired_value, balance * MAX_POSITION_PCT)
+            if desired_value < 1e-8:
+                continue
+            qty = desired_value / price
+            cost = qty * price
+            stop_price = price * (1 - STOP_LOSS_PCT)
+            current = {"entry":price, "qty":qty, "cost":cost, "stop_price":stop_price}
+            continue
+        if sig == "EXIT_X" and current is not None:
+            proceeds = current['qty'] * price
+            profit = proceeds - current['cost']
+            balance += profit
+            trades.append({"time": candles[i]['time'], "symbol":"SIM", "entry": current['entry'], "exit": price, "profit":profit, "balance_after":balance, "reason":"X"})
+            current = None
+            continue
+
+    # force close last open trade at last candle if still open
+    if current is not None:
+        price = candles[-1]['close']
+        proceeds = current['qty'] * price
+        profit = proceeds - current['cost']
+        balance += profit
+        trades.append({"time": candles[-1]['time'], "symbol":"SIM", "entry": current['entry'], "exit": price, "profit":profit, "balance_after":balance, "reason":"CLOSE"})
+
+    # save to state for frontend display
+    state['trades'] = trades
+    state['balance'] = balance
+
+    return jsonify({
+        "final_balance": balance,
+        "trades_count": len(trades),
+        "trades": trades
+    })
+
 @app.route("/api/status")
 def api_status():
-    global balance, current_trade, stats
-    with balance_lock:
-        return jsonify({"balance": round(balance,8), "current_trade": current_trade, "stats": stats, "symbols": SYMBOLS, "trades": trade_history})
+    # return basic status and last N candles
+    return jsonify({
+        "balance": state['balance'],
+        "trades": state['trades'][-200:],
+        "candles": state['candles'][-500:]
+    })
 
-@app.route("/api/candles")
-def api_candles():
-    symbol = request.args.get("symbol", SYMBOLS[0])
-    interval = request.args.get("interval", "1m")
-    limit = int(request.args.get("limit", KL_LIMIT))
-    try:
-        data = fetch_klines(symbol, interval=interval, limit=limit)
-        return jsonify({"symbol": symbol, "candles": data})
-    except Exception as e:
-        debug(f"api/candles error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/backtest", methods=["POST"])
-def api_backtest():
-    data = request.form.to_dict() or request.json or {}
-    # support CSV upload
-    if "csv" in request.files:
-        f = request.files["csv"]
-        text = f.read().decode("utf-8")
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        candles = []
-        for i,ln in enumerate(lines):
-            if i==0 and "time" in ln.lower() and "open" in ln.lower():
-                continue
-            parts = ln.split(",")
-            if len(parts) < 6: continue
-            t = parts[0].strip()
-            try:
-                if t.isdigit() and len(t)>10:
-                    t = int(t)
-                else:
-                    t = int(datetime.fromisoformat(t).timestamp()*1000)
-            except Exception:
-                t = int(datetime.utcnow().timestamp()*1000)
-            candles.append({"time": int(t), "open": float(parts[1]), "high": float(parts[2]), "low": float(parts[3]), "close": float(parts[4]), "volume": float(parts[5])})
-        if not candles:
-            return jsonify({"error":"no candles in CSV"}), 400
-        initial = float(data.get("initial_balance", INITIAL_BALANCE))
-        risk = float(data.get("risk_per_trade", RISK_PER_TRADE))
-        stop = float(data.get("stop_loss_pct", STOP_LOSS_PCT))
-        stats_out, trades_out = run_backtest(candles, initial_balance=initial, risk_per_trade=risk, stop_loss_pct=stop)
-        return jsonify({"stats": stats_out, "trades": trades_out})
-
-    symbol = data.get("symbol", SYMBOLS[0])
-    months = int(data.get("months", 1))
-    interval = data.get("interval", "1m")
-    initial = float(data.get("initial_balance", INITIAL_BALANCE))
-    risk = float(data.get("risk_per_trade", RISK_PER_TRADE))
-    stop = float(data.get("stop_loss_pct", STOP_LOSS_PCT))
-
-    end = datetime.utcnow()
-    start = end - timedelta(days=30*months)
-
-    # fetch pages
-    all_candles = []
-    start_ms = int(start.timestamp()*1000)
-    while True:
-        params = {"symbol": symbol, "interval": interval, "limit": 1000, "startTime": start_ms}
-        r = requests.get(BINANCE_KLINES, params=params, timeout=20)
-        if r.status_code != 200:
-            debug(f"binance fetch error {r.status_code} {r.text[:200]}")
-            return jsonify({"error":f"binance fetch error {r.status_code}"}), 500
-        part = r.json()
-        if not part:
-            break
-        for k in part:
-            all_candles.append({"time": int(k[0]), "open":float(k[1]), "high":float(k[2]), "low":float(k[3]), "close":float(k[4]), "volume":float(k[5])})
-        if len(part) < 1000:
-            break
-        start_ms = part[-1][0] + 1
-        time.sleep(0.15)
-
-    if not all_candles:
-        return jsonify({"error":"no candles retrieved"}), 500
-
-    stats_out, trades_out = run_backtest(all_candles, initial_balance=initial, risk_per_trade=risk, stop_loss_pct=stop)
-    return jsonify({"stats": stats_out, "trades": trades_out})
-
-@app.route("/download_trades")
+@app.route("/api/download_trades")
 def download_trades():
-    try:
-        return send_file(TRADE_LOG, as_attachment=True)
-    except Exception:
-        return jsonify({"error":"no trades yet"}), 404
+    # generate CSV
+    si = StringIO()
+    w = csv.writer(si)
+    w.writerow(["time","entry","exit","profit","balance_after","reason"])
+    for t in state['trades']:
+        w.writerow([t.get('time'), t.get('entry'), t.get('exit'), t.get('profit'), t.get('balance_after'), t.get('reason')])
+    si.seek(0)
+    return app.response_class(si.getvalue(), mimetype='text/csv',
+                              headers={"Content-Disposition":"attachment;filename=trades.csv"})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT","8000")))
+    # for local debug
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",8000)), debug=True)
