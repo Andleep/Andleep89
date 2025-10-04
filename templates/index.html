@@ -2,38 +2,88 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8"/>
   <title>TradeBot — Simulation</title>
-  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-  <script src="/static/app.js"></script>
-  <link rel="stylesheet" href="/static/styles.css">
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; padding: 12px; }
+    #chart { width: 100%; height: 400px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #ccc; padding: 6px; text-align: left; }
+    .controls { margin-bottom: 8px; }
+  </style>
 </head>
 <body>
-  <div class="container">
-    <h2>TradeBot — Simulation (Pure Python)</h2>
-
-    <div class="controls">
-      <label>Initial balance $: <input id="initial_balance" value="10"></label>
-      <label>K neighbors: <input id="k" value="8"></label>
-      <label>Lookback bars: <input id="lookback" value="200"></label>
-      <label>Risk % per trade: <input id="risk_pct" value="0.02"></label>
-      <label>Stop ATR mult: <input id="stop_atr" value="1.0"></label>
-      <button id="load_sample">Load sample & Run</button>
-      <input type="file" id="csvfile">
-    </div>
-
-    <div id="chart" style="height:500px;"></div>
-
-    <div id="stats">
-      <p>Balance: <span id="balance">-</span></p>
-      <p>Trades: <span id="trades_count">0</span> Wins: <span id="wins">0</span> Losses: <span id="losses">0</span></p>
-    </div>
-
-    <h3>Trades (last)</h3>
-    <table id="trades_table" border="1">
-      <thead><tr><th>time</th><th>entry</th><th>exit</th><th>profit</th><th>balance_after</th><th>reason</th></tr></thead>
-      <tbody></tbody>
-    </table>
+  <h3>TradeBot — Simulation</h3>
+  <div class="controls">
+    Symbol: <input id="symbol" value="ETHUSDT"/>
+    Interval: <select id="interval"><option>1m</option><option>5m</option><option>1h</option></select>
+    Period: <select id="period"><option value="1w">1w</option><option value="1m" selected>1m</option><option value="6m">6m</option></select>
+    Initial Balance: <input id="bal" value="10" size="6"/>
+    Risk % per trade: <input id="risk" value="0.01" size="6"/>
+    <button id="run">Run Backtest</button>
   </div>
+
+  <div id="chart"></div>
+
+  <div>
+    <strong>Balance:</strong> <span id="balance">-</span>
+  </div>
+
+  <h4>Trades (last)</h4>
+  <table id="trades">
+    <thead><tr><th>time</th><th>entry</th><th>exit</th><th>profit</th><th>balance_after</th><th>reason</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+<script>
+async function fetchCandles(sym, interval, period){
+  const res = await fetch(`/api/klines?symbol=${sym}&interval=${interval}&period=${period}`);
+  const j = await res.json();
+  return j.candles;
+}
+
+function drawChart(candles, trades){
+  const chartDiv = document.getElementById('chart');
+  chartDiv.innerHTML = '';
+  const chart = LightweightCharts.createChart(chartDiv, { width: chartDiv.clientWidth, height: 400 });
+  const candleSeries = chart.addCandlestickSeries();
+  const data = candles.map(c => ({ time: c.time/1000, open: c.open, high: c.high, low: c.low, close: c.close }));
+  candleSeries.setData(data);
+  // draw trades as markers
+  const markers = [];
+  trades.forEach(t => {
+    markers.push({ time: (new Date(t.time)).getTime()/1000, position: 'belowBar', color: t.profit>=0? 'green':'red', shape: 'arrowUp', text: (t.profit>=0?'+':'') + Number(t.profit).toFixed(6) });
+  });
+  candleSeries.setMarkers(markers);
+}
+
+document.getElementById('run').addEventListener('click', async ()=>{
+  const sym = document.getElementById('symbol').value;
+  const intv = document.getElementById('interval').value;
+  const per = document.getElementById('period').value;
+  const bal = document.getElementById('bal').value;
+  const risk = document.getElementById('risk').value;
+
+  const res = await fetch('/api/backtest', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ symbol: sym, interval: intv, period: per, initial_balance: bal, risk_per_trade: risk })
+  });
+  const j = await res.json();
+  document.getElementById('balance').innerText = j.end_balance;
+  const ttbody = document.querySelector('#trades tbody');
+  ttbody.innerHTML = '';
+  j.trades.forEach(tr=>{
+    const trdom = document.createElement('tr');
+    trdom.innerHTML = `<td>${tr.time}</td><td>${tr.entry}</td><td>${tr.exit}</td><td>${tr.profit}</td><td>${tr.balance_after}</td><td>${tr.reason}</td>`;
+    ttbody.appendChild(trdom);
+  });
+
+  // fetch candles for chart
+  const candles = await fetch(`/api/klines?symbol=${sym}&interval=${intv}&period=${per}`).then(r=>r.json()).then(r=>r.candles);
+  drawChart(candles, j.trades);
+});
+</script>
 </body>
 </html>
