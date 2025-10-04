@@ -1,0 +1,7 @@
+/* static/styles.css */
+body { font-family: Arial, sans-serif; margin:20px; }
+.container { max-width:1100px; margin:0 auto; }
+.controls label { margin-right:10px; }
+#chart { border:1px solid #ddd; padding:10px; background:#fff; }
+table { width:100%; border-collapse:collapse; }
+table th, table td { padding:6px 8px; text-align:left; }
