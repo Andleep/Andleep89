@@ -1,95 +1,85 @@
 // static/app.js
-let chart = null;
+document.addEventListener("DOMContentLoaded", function(){
+  const loadSampleBtn = document.getElementById("load_sample");
+  const csvfile = document.getElementById("csvfile");
+  const chartDiv = document.getElementById("chart");
+  const balanceEl = document.getElementById("balance");
+  const tradesCountEl = document.getElementById("trades_count");
+  const winsEl = document.getElementById("wins");
+  const lossesEl = document.getElementById("losses");
+  const tradesTableBody = document.querySelector("#trades_table tbody");
 
-function isoTime(t){
-  try{
-    // if t is ms int
-    if(typeof t === "number") return new Date(t).toLocaleString();
-    if(!isNaN(Number(t))) return new Date(Number(t)).toLocaleString();
-    return t;
-  }catch(e){return t;}
-}
-
-async function fetchStatus(){
-  const r = await fetch("/api/status");
-  const j = await r.json();
-  document.getElementById("balance").textContent = (Math.round((j.balance + Number.EPSILON)*100000000)/100000000).toString();
-  drawChart(j.candles, j.trades);
-  populateTrades(j.trades);
-}
-
-function drawChart(candles, trades){
-  const labels = candles.map(c=> isoTime(c.time));
-  const closes = candles.map(c=> c.close);
-  // trade markers
-  const buys = trades.filter(t=> t.profit >=0 || t.reason === "CLOSE").map(t=> ({x: isoTime(t.time), y: t.exit}));
-  const sells = trades.filter(t=> t.profit < 0 && t.reason !== "CLOSE").map(t=> ({x: isoTime(t.time), y: t.exit}));
-  const ctx = document.getElementById('priceChart').getContext('2d');
-  if(chart) chart.destroy();
-  chart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: labels,
-      datasets: [
-        { label: 'Close', data: closes, borderColor:'#2b8aef', tension:0.1, pointRadius:0 },
-        { label: 'Buys', data: buys.map(p=> p.y), pointBackgroundColor:'green', type:'scatter', showLine:false },
-        { label: 'Sells', data: sells.map(p=> p.y), pointBackgroundColor:'red', type:'scatter', showLine:false }
-      ]
-    },
-    options: {
-      interaction:{mode:'index'},
-      plugins:{legend:{display:true}},
-      scales:{ x:{ display:true } }
+  function arrayToCSV(rows) {
+    if (!rows || !rows.length) return "";
+    const keys = Object.keys(rows[0]);
+    const lines = [keys.join(",")];
+    for (const r of rows) {
+      lines.push(keys.map(k => r[k]).join(","));
     }
+    return lines.join("\n");
+  }
+
+  function runBacktestWithCSV(csvText) {
+    const payload = {
+      csv_data: csvText,
+      params: {
+        initial_balance: parseFloat(document.getElementById("initial_balance").value),
+        k_neighbors: parseInt(document.getElementById("k").value),
+        lookback: parseInt(document.getElementById("lookback").value),
+        stop_atr_mult: parseFloat(document.getElementById("stop_atr").value),
+        risk_pct: parseFloat(document.getElementById("risk_pct").value)
+      }
+    };
+    fetch("/api/run_backtest", {
+      method:"POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    }).then(r => r.json()).then(drawResults).catch(e => alert("Error: "+e));
+  }
+
+  loadSampleBtn.addEventListener("click", function(){
+    // fetch sample server-side via run_backtest without CSV_text (server loads sample file)
+    runBacktestWithCSV(null);
   });
-}
 
-function populateTrades(trades){
-  const tbody = document.querySelector("#trades-table tbody");
-  tbody.innerHTML = "";
-  trades.slice().reverse().forEach(t=>{
-    const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${isoTime(t.time)}</td><td>${t.entry}</td><td>${t.exit}</td><td>${t.profit}</td><td>${t.balance_after}</td><td>${t.reason}</td>`;
-    tbody.appendChild(tr);
+  csvfile.addEventListener("change", function(e){
+    const f = e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = function(ev){
+      const txt = ev.target.result;
+      runBacktestWithCSV(txt);
+    };
+    reader.readAsText(f);
   });
-}
 
-document.getElementById("load-sample").addEventListener("click", async ()=>{
-  await fetch("/api/load_sample");
-  await fetchStatus();
-});
+  function drawResults(result){
+    if (result.error){
+      alert(result.error);
+      return;
+    }
+    // build candlestick from CSV used on server (server used sample file or csv provided).
+    // The server didn't return full candle series; but equity curve is returned with timestamps.
+    // For better plotting, we will reuse server-sent trades and equity for now.
 
-document.getElementById("run-backtest").addEventListener("click", async ()=>{
-  const body = {
-    ema_short: 20,
-    ema_long: 50,
-    rsi_period: 14,
-    volume_multiplier: 1.2
-  };
-  const r = await fetch("/api/run_backtest", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify(body)
-  });
-  const j = await r.json();
-  alert("Backtest finished. Final balance: "+ j.final_balance.toFixed(8));
-  await fetchStatus();
-});
+    // show stats
+    balanceEl.textContent = parseFloat(result.final_balance).toFixed(8);
+    tradesCountEl.textContent = result.trades.length;
+    winsEl.textContent = result.stats.wins;
+    lossesEl.textContent = result.stats.losses;
 
-document.getElementById("file").addEventListener("change", async (ev)=>{
-  const f = ev.target.files[0];
-  if(!f) return;
-  const form = new FormData();
-  form.append("file", f);
-  const r = await fetch("/api/upload_csv", { method:"POST", body: form });
-  const j = await r.json();
-  if(j.error) alert("Upload error: "+ j.error);
-  else {
-    alert("Uploaded "+ j.candles +" candles.");
-    await fetchStatus();
+    // populate trades table
+    tradesTableBody.innerHTML = "";
+    for (const t of result.trades.slice(-200).reverse()){
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${t.time_str||t.time}</td><td>${t.entry}</td><td>${t.exit}</td><td>${t.profit}</td><td>${t.balance_after}</td><td>${t.reason}</td>`;
+      tradesTableBody.appendChild(tr);
+    }
+
+    // draw equity curve
+    const x = result.equity.map(e => new Date(e.time));
+    const y = result.equity.map(e => e.equity);
+    const trace = { x:x, y:y, type:"scatter", name:"Equity" };
+    Plotly.newPlot(chartDiv, [trace], {margin:{t:30}});
   }
 });
-
-// initial
-fetchStatus();
-setInterval(fetchStatus, 5000);
