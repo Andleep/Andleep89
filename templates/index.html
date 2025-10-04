@@ -1,39 +1,39 @@
+<!-- templates/index.html -->
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>TradeBot — Simulation</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <style>
-    body{font-family: Arial, Helvetica, sans-serif; margin:20px;}
-    #chart-wrap{width:100%; max-width:1100px;}
-    table{border-collapse:collapse; width:100%; margin-top:10px;}
-    th,td{border:1px solid #ddd; padding:6px; font-size:13px;}
-    th{background:#f4f4f4;}
-    .btn{padding:8px 12px; border-radius:6px; cursor:pointer; background:#2b8aef; color:white; border:none;}
-  </style>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <script src="/static/app.js"></script>
+  <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <h2>TradeBot — Simulation (no pandas)</h2>
-  <div>
-    <button class="btn" id="load-sample">Load sample data</button>
-    <input type="file" id="file" accept=".csv">
-    <button class="btn" id="run-backtest">Run Backtest</button>
-    <a id="download" href="/api/download_trades" target="_blank" style="margin-left:10px">Download trades</a>
+  <div class="container">
+    <h2>TradeBot — Simulation (Pure Python)</h2>
+
+    <div class="controls">
+      <label>Initial balance $: <input id="initial_balance" value="10"></label>
+      <label>K neighbors: <input id="k" value="8"></label>
+      <label>Lookback bars: <input id="lookback" value="200"></label>
+      <label>Risk % per trade: <input id="risk_pct" value="0.02"></label>
+      <label>Stop ATR mult: <input id="stop_atr" value="1.0"></label>
+      <button id="load_sample">Load sample & Run</button>
+      <input type="file" id="csvfile">
+    </div>
+
+    <div id="chart" style="height:500px;"></div>
+
+    <div id="stats">
+      <p>Balance: <span id="balance">-</span></p>
+      <p>Trades: <span id="trades_count">0</span> Wins: <span id="wins">0</span> Losses: <span id="losses">0</span></p>
+    </div>
+
+    <h3>Trades (last)</h3>
+    <table id="trades_table" border="1">
+      <thead><tr><th>time</th><th>entry</th><th>exit</th><th>profit</th><th>balance_after</th><th>reason</th></tr></thead>
+      <tbody></tbody>
+    </table>
   </div>
-
-  <div id="chart-wrap">
-    <canvas id="priceChart" height="200"></canvas>
-  </div>
-
-  <h3>Balance: <span id="balance">-</span></h3>
-
-  <h3>Trades (last 200)</h3>
-  <table id="trades-table">
-    <thead><tr><th>time</th><th>entry</th><th>exit</th><th>profit</th><th>balance_after</th><th>reason</th></tr></thead>
-    <tbody></tbody>
-  </table>
-
-  <script src="/static/app.js"></script>
 </body>
 </html>
